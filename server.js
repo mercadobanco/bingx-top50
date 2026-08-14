@@ -5,14 +5,15 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const TICKER_URL = 'https://open-api.bingx.com/openApi/spot/v1/ticker/24hr';
-const KLINE_URL  = 'https://open-api.bingx.com/openApi/spot/v1/market/kline';
-const TOP_N = 50;
+const TOP_N = 80;
 const CONCURRENCY = 8;
-
-// Cache simple (60 segundos)
-let cache = { data: null, timestamp: 0 };
 const CACHE_MS = 60 * 1000;
+
+// cache por mercado: { spot: {...}, swap: {...} }
+const cache = {
+  spot: { data: null, timestamp: 0 },
+  swap: { data: null, timestamp: 0 }
+};
 
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -29,12 +30,15 @@ async function mapPool(items, concurrency, fn) {
   return results;
 }
 
-async function get4hChange(symbol, lastPrice) {
+// --- SPOT ---
+async function getSpotChange(symbol, lastPrice, interval) {
   try {
-    const res = await fetch(`${KLINE_URL}?symbol=${symbol}&interval=4h&limit=2`);
+    const res = await fetch(
+      `https://open-api.bingx.com/openApi/spot/v1/market/kline?symbol=${symbol}&interval=${interval}&limit=2`
+    );
     const json = await res.json();
     if (json.code !== 0 || !json.data?.length) return null;
-    const open = parseFloat(json.data[0][1]);
+    const open = parseFloat(json.data[0][1]); // array: [time, open, high, low, close, ...]
     if (!open) return null;
     return ((parseFloat(lastPrice) - open) / open) * 100;
   } catch {
@@ -42,37 +46,101 @@ async function get4hChange(symbol, lastPrice) {
   }
 }
 
-app.get('/api/top50', async (req, res) => {
+async function fetchSpot() {
+  const res = await fetch('https://open-api.bingx.com/openApi/spot/v1/ticker/24hr');
+  const json = await res.json();
+  if (json.code !== 0 || !Array.isArray(json.data)) throw new Error('BingX Spot ticker error');
+
+  const top = json.data
+    .filter(t => t.symbol.endsWith('-USDT') && parseFloat(t.quoteVolume) > 0)
+    .sort((a, b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
+    .slice(0, TOP_N);
+
+  return mapPool(top, CONCURRENCY, async (t) => {
+    const [change1h, change4h] = await Promise.all([
+      getSpotChange(t.symbol, t.lastPrice, '1h'),
+      getSpotChange(t.symbol, t.lastPrice, '4h')
+    ]);
+    let change24h = null;
+    if (t.priceChangePercent) {
+      change24h = parseFloat(String(t.priceChangePercent).replace('%', ''));
+    }
+    return {
+      symbol: t.symbol,
+      lastPrice: t.lastPrice,
+      quoteVolume: parseFloat(t.quoteVolume),
+      change1h,
+      change4h,
+      change24h
+    };
+  });
+}
+
+// --- PERPETUAL (SWAP USDT-M) ---
+async function getSwapChange(symbol, lastPrice, interval) {
   try {
-    // Usar cache si está fresco
-    if (cache.data && Date.now() - cache.timestamp < CACHE_MS) {
-      return res.json({ ok: true, cached: true, data: cache.data });
+    const res = await fetch(
+      `https://open-api.bingx.com/openApi/swap/v3/quote/klines?symbol=${symbol}&interval=${interval}&limit=2`
+    );
+    const json = await res.json();
+    if (json.code !== 0 || !json.data?.length) return null;
+
+    // Swap devuelve objetos: { open, close, high, low, volume, time }
+    const candle = json.data[0];
+    const open = parseFloat(candle.open);
+    if (!open) return null;
+    return ((parseFloat(lastPrice) - open) / open) * 100;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchSwap() {
+  const res = await fetch('https://open-api.bingx.com/openApi/swap/v2/quote/ticker');
+  const json = await res.json();
+  if (json.code !== 0 || !Array.isArray(json.data)) throw new Error('BingX Swap ticker error');
+
+  const top = json.data
+    .filter(t => t.symbol.endsWith('-USDT') && parseFloat(t.quoteVolume) > 0)
+    .sort((a, b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
+    .slice(0, TOP_N);
+
+  return mapPool(top, CONCURRENCY, async (t) => {
+    const [change1h, change4h] = await Promise.all([
+      getSwapChange(t.symbol, t.lastPrice, '1h'),
+      getSwapChange(t.symbol, t.lastPrice, '4h')
+    ]);
+    let change24h = null;
+    if (t.priceChangePercent != null) {
+      change24h = parseFloat(String(t.priceChangePercent).replace('%', ''));
+    }
+    return {
+      symbol: t.symbol,
+      lastPrice: t.lastPrice,
+      quoteVolume: parseFloat(t.quoteVolume),
+      change1h,
+      change4h,
+      change24h
+    };
+  });
+}
+
+app.get('/api/top', async (req, res) => {
+  try {
+    const market = (req.query.market || 'spot').toLowerCase();
+    if (market !== 'spot' && market !== 'swap') {
+      return res.status(400).json({ ok: false, error: 'market debe ser spot o swap' });
     }
 
-    const tickerRes = await fetch(TICKER_URL);
-    const tickerJson = await tickerRes.json();
-
-    if (tickerJson.code !== 0 || !Array.isArray(tickerJson.data)) {
-      return res.status(502).json({ ok: false, error: 'BingX ticker error' });
+    const c = cache[market];
+    if (c.data && Date.now() - c.timestamp < CACHE_MS) {
+      return res.json({ ok: true, cached: true, market, data: c.data });
     }
 
-    const top = tickerJson.data
-      .filter(t => t.symbol.endsWith('-USDT') && parseFloat(t.quoteVolume) > 0)
-      .sort((a, b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
-      .slice(0, TOP_N);
+    const data = market === 'spot' ? await fetchSpot() : await fetchSwap();
+    cache[market] = { data, timestamp: Date.now() };
 
-    const with4h = await mapPool(top, CONCURRENCY, async (t) => {
-      const change4h = await get4hChange(t.symbol, t.lastPrice);
-      return {
-        symbol: t.symbol,
-        lastPrice: t.lastPrice,
-        quoteVolume: t.quoteVolume,
-        change4h
-      };
-    });
-
-    cache = { data: with4h, timestamp: Date.now() };
-    res.json({ ok: true, cached: false, data: with4h });
+    res.json({ ok: true, cached: false, market, data });
   } catch (err) {
     console.error(err);
     res.status(500).json({ ok: false, error: err.message });
@@ -80,5 +148,5 @@ app.get('/api/top50', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Servidor corriendo en http://localhost:${PORT}`);
+  console.log(`Servidor en http://localhost:${PORT}`);
 });
