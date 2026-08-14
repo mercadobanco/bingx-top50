@@ -65,6 +65,13 @@
     .filters input:focus, .filters select:focus { border-color: #3b82f6; }
     .filters input[type="number"] { width: 140px; }
 
+    .status {
+      font-size: 0.8rem;
+      color: #60a5fa;
+      margin-bottom: 10px;
+      min-height: 1.2em;
+    }
+
     table {
       width: 100%;
       border-collapse: collapse;
@@ -156,6 +163,7 @@
       </label>
     </div>
 
+    <div class="status" id="status"></div>
     <div id="content">
       <div class="loading">Cargando datos de BingX...</div>
     </div>
@@ -165,6 +173,7 @@
     let rawData = [];
     let sortKey = 'volume';
     let sortDir = 'desc';
+    let currentMarket = 'spot';
 
     function formatPrice(p) {
       const n = parseFloat(p);
@@ -199,4 +208,147 @@
           case 'volume':    va = a.quoteVolume; vb = b.quoteVolume; break;
           case 'change1h':  va = a.change1h ?? -Infinity; vb = b.change1h ?? -Infinity; break;
           case 'change4h':  va = a.change4h ?? -Infinity; vb = b.change4h ?? -Infinity; break;
-          case 'change24h': va = a.change24h ?? -Infinity; vb =
+          case 'change24h': va = a.change24h ?? -Infinity; vb = b.change24h ?? -Infinity; break;
+          case 'price':     va = parseFloat(a.lastPrice); vb = parseFloat(b.lastPrice); break;
+          case 'symbol':    va = a.symbol; vb = b.symbol; break;
+          default:          va = a.quoteVolume; vb = b.quoteVolume;
+        }
+        if (typeof va === 'string') {
+          return sortDir === 'asc' ? va.localeCompare(vb) : vb.localeCompare(va);
+        }
+        return sortDir === 'asc' ? va - vb : vb - va;
+      });
+      return list;
+    }
+
+    function render() {
+      const list = getFilteredSorted();
+      const content = document.getElementById('content');
+
+      if (!list.length) {
+        content.innerHTML = '<div class="empty">No hay pares con ese volumen mínimo.</div>';
+        return;
+      }
+
+      const arrow = (key) => {
+        if (sortKey !== key) return '<span class="arrow">↕</span>';
+        return sortDir === 'desc' ? '<span class="arrow">↓</span>' : '<span class="arrow">↑</span>';
+      };
+
+      let html = `
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th class="${sortKey==='symbol'?'active':''}" onclick="setSort('symbol')">Par ${arrow('symbol')}</th>
+              <th class="${sortKey==='price'?'active':''}" onclick="setSort('price')">Precio ${arrow('price')}</th>
+              <th class="${sortKey==='change1h'?'active':''}" onclick="setSort('change1h')">1h ${arrow('change1h')}</th>
+              <th class="${sortKey==='change4h'?'active':''}" onclick="setSort('change4h')">4h ${arrow('change4h')}</th>
+              <th class="${sortKey==='change24h'?'active':''}" onclick="setSort('change24h')">24h ${arrow('change24h')}</th>
+              <th class="hide-mobile ${sortKey==='volume'?'active':''}" onclick="setSort('volume')">Volumen ${arrow('volume')}</th>
+            </tr>
+          </thead>
+          <tbody>
+      `;
+
+      list.forEach((t, i) => {
+        html += `
+          <tr>
+            <td class="rank">${i + 1}</td>
+            <td class="symbol">${t.symbol}</td>
+            <td class="price">$${formatPrice(t.lastPrice)}</td>
+            <td>${formatChange(t.change1h)}</td>
+            <td>${formatChange(t.change4h)}</td>
+            <td>${formatChange(t.change24h)}</td>
+            <td class="volume hide-mobile">$${formatVolume(t.quoteVolume)}</td>
+          </tr>
+        `;
+      });
+
+      html += '</tbody></table>';
+      content.innerHTML = html;
+    }
+
+    function setSort(key) {
+      if (sortKey === key) {
+        sortDir = sortDir === 'desc' ? 'asc' : 'desc';
+      } else {
+        sortKey = key;
+        sortDir = (key === 'symbol') ? 'asc' : 'desc';
+      }
+      document.getElementById('sortBy').value = sortKey;
+      document.getElementById('sortDir').value = sortDir;
+      render();
+    }
+
+    async function enrichInBackground(market) {
+      const status = document.getElementById('status');
+      status.textContent = 'Calculando variaciones 1h y 4h...';
+      try {
+        const res = await fetch(`/api/enrich?market=${market}`);
+        const json = await res.json();
+        if (!json.ok) throw new Error(json.error || 'Error al enriquecer');
+        if (market !== currentMarket) return; // cambió de mercado mientras cargaba
+        rawData = json.data;
+        render();
+        status.textContent = 'Variaciones 1h / 4h listas';
+        setTimeout(() => { if (status.textContent.includes('listas')) status.textContent = ''; }, 2500);
+      } catch (err) {
+        status.textContent = 'No se pudieron cargar 1h/4h (se muestran 24h)';
+        console.error(err);
+      }
+    }
+
+    async function fetchData() {
+      const btn = document.getElementById('refreshBtn');
+      const content = document.getElementById('content');
+      const status = document.getElementById('status');
+      const market = document.getElementById('market').value;
+      currentMarket = market;
+
+      btn.disabled = true;
+      status.textContent = '';
+      content.innerHTML = `<div class="loading">Cargando ${market === 'spot' ? 'Spot' : 'Futuros Perpetual'}...</div>`;
+
+      try {
+        const res = await fetch(`/api/top?market=${market}`);
+        const json = await res.json();
+        if (!json.ok) throw new Error(json.error || 'Error desconocido');
+
+        rawData = json.data;
+
+        const now = new Date().toLocaleString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires' });
+        const cached = json.cached ? ' (cache)' : '';
+        const label = market === 'spot' ? 'Spot' : 'Futuros Perpetual';
+        document.getElementById('lastUpdate').textContent =
+          `Actualizado: ${now}${cached} · BingX ${label}`;
+
+        render();
+        btn.disabled = false;
+
+        // Si aún no tiene 1h/4h, completar en background
+        if (!json.enriched) {
+          enrichInBackground(market);
+        }
+      } catch (err) {
+        content.innerHTML = `<div class="error">Error: ${err.message}<br><br>Reintentá en unos segundos.</div>`;
+        btn.disabled = false;
+      }
+    }
+
+    document.getElementById('minVolume').addEventListener('input', render);
+    document.getElementById('sortBy').addEventListener('change', (e) => {
+      sortKey = e.target.value;
+      render();
+    });
+    document.getElementById('sortDir').addEventListener('change', (e) => {
+      sortDir = e.target.value;
+      render();
+    });
+    document.getElementById('market').addEventListener('change', fetchData);
+
+    fetchData();
+    setInterval(fetchData, 120000);
+  </script>
+</body>
+</html>
