@@ -9,7 +9,6 @@ const TOP_N = 80;
 const CONCURRENCY = 8;
 const CACHE_MS = 60 * 1000;
 
-// cache por mercado: { spot: {...}, swap: {...} }
 const cache = {
   spot: { data: null, timestamp: 0 },
   swap: { data: null, timestamp: 0 }
@@ -30,7 +29,7 @@ async function mapPool(items, concurrency, fn) {
   return results;
 }
 
-// --- SPOT ---
+// ===== SPOT =====
 async function getSpotChange(symbol, lastPrice, interval) {
   try {
     const res = await fetch(
@@ -38,7 +37,7 @@ async function getSpotChange(symbol, lastPrice, interval) {
     );
     const json = await res.json();
     if (json.code !== 0 || !json.data?.length) return null;
-    const open = parseFloat(json.data[0][1]); // array: [time, open, high, low, close, ...]
+    const open = parseFloat(json.data[0][1]);
     if (!open) return null;
     return ((parseFloat(lastPrice) - open) / open) * 100;
   } catch {
@@ -76,7 +75,7 @@ async function fetchSpot() {
   });
 }
 
-// --- PERPETUAL (SWAP USDT-M) ---
+// ===== PERPETUAL (SWAP) =====
 async function getSwapChange(symbol, lastPrice, interval) {
   try {
     const res = await fetch(
@@ -84,8 +83,6 @@ async function getSwapChange(symbol, lastPrice, interval) {
     );
     const json = await res.json();
     if (json.code !== 0 || !json.data?.length) return null;
-
-    // Swap devuelve objetos: { open, close, high, low, volume, time }
     const candle = json.data[0];
     const open = parseFloat(candle.open);
     if (!open) return null;
