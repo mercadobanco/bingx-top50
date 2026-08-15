@@ -6,6 +6,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 const TOP_N = 50;
+const LIQUIDITY_N = 25;
 const CONCURRENCY = 10;
 const CACHE_MS = 45 * 1000;
 
@@ -40,6 +41,50 @@ function withTimeout(promise, ms = 6000) {
   ]);
 }
 
+function isTradFi(symbol) {
+  const s = symbol.toUpperCase();
+  return (
+    s.startsWith('NCCO') ||
+    s.startsWith('NCFX') ||
+    s.startsWith('NCSI') ||
+    s.startsWith('NCS') ||
+    (s.includes('GOLD') && s.startsWith('NC')) ||
+    (s.includes('OIL') && s.startsWith('NC'))
+  );
+}
+
+function calcLiquidity(bids, asks) {
+  if (!bids?.length || !asks?.length) {
+    return { spreadPct: null, depth2pct: null };
+  }
+  const bestBid = parseFloat(bids[0][0]);
+  const bestAsk = parseFloat(asks[0][0]);
+  if (!bestBid || !bestAsk || bestAsk <= 0) {
+    return { spreadPct: null, depth2pct: null };
+  }
+  const mid = (bestBid + bestAsk) / 2;
+  const spreadPct = ((bestAsk - bestBid) / mid) * 100;
+
+  const low = mid * 0.98;
+  const high = mid * 1.02;
+  let depth = 0;
+
+  for (const [p, q] of bids) {
+    const price = parseFloat(p);
+    const qty = parseFloat(q);
+    if (price >= low) depth += price * qty;
+    else break;
+  }
+  for (const [p, q] of asks) {
+    const price = parseFloat(p);
+    const qty = parseFloat(q);
+    if (price <= high) depth += price * qty;
+    else break;
+  }
+
+  return { spreadPct, depth2pct: depth };
+}
+
 // ===== SPOT =====
 async function getSpotChange(symbol, lastPrice, interval) {
   const res = await withTimeout(
@@ -50,6 +95,15 @@ async function getSpotChange(symbol, lastPrice, interval) {
   const open = parseFloat(json.data[0][1]);
   if (!open) return null;
   return ((parseFloat(lastPrice) - open) / open) * 100;
+}
+
+async function getSpotDepth(symbol) {
+  const res = await withTimeout(
+    fetch(`https://open-api.bingx.com/openApi/spot/v1/market/depth?symbol=${encodeURIComponent(symbol)}&limit=50`)
+  );
+  const json = await res.json();
+  if (json.code !== 0 || !json.data) return { spreadPct: null, depth2pct: null };
+  return calcLiquidity(json.data.bids, json.data.asks);
 }
 
 async function fetchSpotTickers() {
@@ -72,12 +126,15 @@ async function fetchSpotTickers() {
       change4h: null,
       change24h: t.priceChangePercent
         ? parseFloat(String(t.priceChangePercent).replace('%', ''))
-        : null
+        : null,
+      spreadPct: null,
+      depth2pct: null,
+      assetType: isTradFi(t.symbol) ? 'tradfi' : 'crypto'
     }));
 }
 
 async function enrichSpot(list) {
-  return mapPool(list, CONCURRENCY, async (t) => {
+  let enriched = await mapPool(list, CONCURRENCY, async (t) => {
     try {
       const [change1h, change4h] = await Promise.all([
         getSpotChange(t.symbol, t.lastPrice, '1h').catch(() => null),
@@ -88,9 +145,23 @@ async function enrichSpot(list) {
       return t;
     }
   });
+
+  const top25 = enriched.slice(0, LIQUIDITY_N);
+  const rest = enriched.slice(LIQUIDITY_N);
+
+  const withLiq = await mapPool(top25, CONCURRENCY, async (t) => {
+    try {
+      const liq = await getSpotDepth(t.symbol);
+      return { ...t, ...liq };
+    } catch {
+      return t;
+    }
+  });
+
+  return [...withLiq, ...rest];
 }
 
-// ===== SWAP / PERPETUAL =====
+// ===== SWAP =====
 async function getSwapChange(symbol, lastPrice, interval) {
   const res = await withTimeout(
     fetch(`https://open-api.bingx.com/openApi/swap/v3/quote/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=2`)
@@ -100,6 +171,15 @@ async function getSwapChange(symbol, lastPrice, interval) {
   const open = parseFloat(json.data[0].open);
   if (!open) return null;
   return ((parseFloat(lastPrice) - open) / open) * 100;
+}
+
+async function getSwapDepth(symbol) {
+  const res = await withTimeout(
+    fetch(`https://open-api.bingx.com/openApi/swap/v2/quote/depth?symbol=${encodeURIComponent(symbol)}&limit=50`)
+  );
+  const json = await res.json();
+  if (json.code !== 0 || !json.data) return { spreadPct: null, depth2pct: null };
+  return calcLiquidity(json.data.bids, json.data.asks);
 }
 
 async function fetchSwapTickers() {
@@ -122,12 +202,15 @@ async function fetchSwapTickers() {
       change4h: null,
       change24h: t.priceChangePercent != null
         ? parseFloat(String(t.priceChangePercent).replace('%', ''))
-        : null
+        : null,
+      spreadPct: null,
+      depth2pct: null,
+      assetType: isTradFi(t.symbol) ? 'tradfi' : 'crypto'
     }));
 }
 
 async function enrichSwap(list) {
-  return mapPool(list, CONCURRENCY, async (t) => {
+  let enriched = await mapPool(list, CONCURRENCY, async (t) => {
     try {
       const [change1h, change4h] = await Promise.all([
         getSwapChange(t.symbol, t.lastPrice, '1h').catch(() => null),
@@ -138,9 +221,22 @@ async function enrichSwap(list) {
       return t;
     }
   });
+
+  const top25 = enriched.slice(0, LIQUIDITY_N);
+  const rest = enriched.slice(LIQUIDITY_N);
+
+  const withLiq = await mapPool(top25, CONCURRENCY, async (t) => {
+    try {
+      const liq = await getSwapDepth(t.symbol);
+      return { ...t, ...liq };
+    } catch {
+      return t;
+    }
+  });
+
+  return [...withLiq, ...rest];
 }
 
-// Solo tickers (rápido)
 app.get('/api/top', async (req, res) => {
   try {
     const market = (req.query.market || 'spot').toLowerCase();
@@ -161,7 +257,6 @@ app.get('/api/top', async (req, res) => {
   }
 });
 
-// Completar 1h y 4h
 app.get('/api/enrich', async (req, res) => {
   try {
     const market = (req.query.market || 'spot').toLowerCase();
