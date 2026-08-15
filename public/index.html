@@ -13,7 +13,7 @@
       min-height: 100vh;
       padding: 20px;
     }
-    .container { max-width: 1100px; margin: 0 auto; }
+    .container { max-width: 1200px; margin: 0 auto; }
     header {
       display: flex;
       justify-content: space-between;
@@ -63,7 +63,6 @@
       outline: none;
     }
     .filters input:focus, .filters select:focus { border-color: #3b82f6; }
-    .filters input[type="number"] { width: 140px; }
 
     .status {
       font-size: 0.8rem;
@@ -81,13 +80,13 @@
       box-shadow: 0 4px 20px rgba(0,0,0,0.3);
     }
     th, td {
-      padding: 11px 12px;
+      padding: 10px 11px;
       text-align: left;
       border-bottom: 1px solid #2d3142;
     }
     th {
       background: #252836;
-      font-size: 0.75rem;
+      font-size: 0.72rem;
       text-transform: uppercase;
       letter-spacing: 0.04em;
       color: #9ca3af;
@@ -98,15 +97,25 @@
       white-space: nowrap;
     }
     th:hover { color: #e5e7eb; }
-    th .arrow { margin-left: 4px; opacity: 0.5; }
+    th .arrow { margin-left: 3px; opacity: 0.5; }
     th.active .arrow { opacity: 1; color: #3b82f6; }
     tr:hover { background: #22263a; }
-    .rank { color: #6b7280; font-weight: 600; width: 40px; }
+    .rank { color: #6b7280; font-weight: 600; width: 36px; }
     .symbol { font-weight: 700; }
+    .badge {
+      font-size: 0.65rem;
+      padding: 1px 5px;
+      border-radius: 4px;
+      margin-left: 6px;
+      font-weight: 600;
+      vertical-align: middle;
+    }
+    .badge-crypto { background: #1e3a5f; color: #93c5fd; }
+    .badge-tradfi { background: #3b2f1a; color: #fbbf24; }
     .price { font-variant-numeric: tabular-nums; }
     .positive { color: #22c55e; }
     .negative { color: #ef4444; }
-    .volume { color: #9ca3af; font-size: 0.9rem; }
+    .muted { color: #9ca3af; font-size: 0.9rem; }
     .loading, .error, .empty {
       text-align: center;
       padding: 50px 20px;
@@ -114,10 +123,9 @@
     }
     .error { color: #ef4444; }
 
-    @media (max-width: 700px) {
-      th, td { padding: 9px 6px; font-size: 0.85rem; }
+    @media (max-width: 800px) {
+      th, td { padding: 8px 5px; font-size: 0.82rem; }
       .hide-mobile { display: none; }
-      .filters input[type="number"] { width: 110px; }
     }
   </style>
 </head>
@@ -140,8 +148,19 @@
         </select>
       </label>
       <label>
-        Volumen mínimo (USD):
-        <input type="number" id="minVolume" placeholder="ej: 1000000" min="0" step="1000">
+        Tipo:
+        <select id="assetType">
+          <option value="all">Todo</option>
+          <option value="crypto">Criptos</option>
+          <option value="tradfi">TradFi</option>
+        </select>
+      </label>
+      <label>
+        Vol en USD:
+        <select id="minVolume">
+          <option value="0">Todo</option>
+          <option value="1000000">1M USD+</option>
+        </select>
       </label>
       <label>
         Ordenar por:
@@ -150,6 +169,8 @@
           <option value="change1h">Var. 1h</option>
           <option value="change4h">Var. 4h</option>
           <option value="change24h">Var. 24h</option>
+          <option value="spread">Spread</option>
+          <option value="depth">Depth ±2%</option>
           <option value="price">Precio</option>
           <option value="symbol">Par</option>
         </select>
@@ -198,9 +219,26 @@
       return `<span class="${cls}">${sign}${num.toFixed(2)}%</span>`;
     }
 
+    function formatSpread(num) {
+      if (num === null || num === undefined || isNaN(num)) return '<span style="color:#6b7280">—</span>';
+      return `<span class="muted">${num.toFixed(3)}%</span>`;
+    }
+
+    function formatDepth(num) {
+      if (num === null || num === undefined || isNaN(num)) return '<span style="color:#6b7280">—</span>';
+      return `<span class="muted">$${formatVolume(num)}</span>`;
+    }
+
     function getFilteredSorted() {
       const minVol = parseFloat(document.getElementById('minVolume').value) || 0;
-      let list = rawData.filter(t => t.quoteVolume >= minVol);
+      const typeFilter = document.getElementById('assetType').value;
+
+      let list = rawData.filter(t => {
+        if (t.quoteVolume < minVol) return false;
+        if (typeFilter === 'crypto' && t.assetType !== 'crypto') return false;
+        if (typeFilter === 'tradfi' && t.assetType !== 'tradfi') return false;
+        return true;
+      });
 
       list.sort((a, b) => {
         let va, vb;
@@ -209,6 +247,8 @@
           case 'change1h':  va = a.change1h ?? -Infinity; vb = b.change1h ?? -Infinity; break;
           case 'change4h':  va = a.change4h ?? -Infinity; vb = b.change4h ?? -Infinity; break;
           case 'change24h': va = a.change24h ?? -Infinity; vb = b.change24h ?? -Infinity; break;
+          case 'spread':    va = a.spreadPct ?? Infinity; vb = b.spreadPct ?? Infinity; break;
+          case 'depth':     va = a.depth2pct ?? -Infinity; vb = b.depth2pct ?? -Infinity; break;
           case 'price':     va = parseFloat(a.lastPrice); vb = parseFloat(b.lastPrice); break;
           case 'symbol':    va = a.symbol; vb = b.symbol; break;
           default:          va = a.quoteVolume; vb = b.quoteVolume;
@@ -226,7 +266,7 @@
       const content = document.getElementById('content');
 
       if (!list.length) {
-        content.innerHTML = '<div class="empty">No hay pares con ese volumen mínimo.</div>';
+        content.innerHTML = '<div class="empty">No hay pares con esos filtros.</div>';
         return;
       }
 
@@ -245,6 +285,8 @@
               <th class="${sortKey==='change1h'?'active':''}" onclick="setSort('change1h')">1h ${arrow('change1h')}</th>
               <th class="${sortKey==='change4h'?'active':''}" onclick="setSort('change4h')">4h ${arrow('change4h')}</th>
               <th class="${sortKey==='change24h'?'active':''}" onclick="setSort('change24h')">24h ${arrow('change24h')}</th>
+              <th class="hide-mobile ${sortKey==='spread'?'active':''}" onclick="setSort('spread')">Spread ${arrow('spread')}</th>
+              <th class="hide-mobile ${sortKey==='depth'?'active':''}" onclick="setSort('depth')">Depth ±2% ${arrow('depth')}</th>
               <th class="hide-mobile ${sortKey==='volume'?'active':''}" onclick="setSort('volume')">Volumen ${arrow('volume')}</th>
             </tr>
           </thead>
@@ -252,15 +294,20 @@
       `;
 
       list.forEach((t, i) => {
+        const badge = t.assetType === 'tradfi'
+          ? '<span class="badge badge-tradfi">TF</span>'
+          : '<span class="badge badge-crypto">C</span>';
         html += `
           <tr>
             <td class="rank">${i + 1}</td>
-            <td class="symbol">${t.symbol}</td>
+            <td class="symbol">${t.symbol}${badge}</td>
             <td class="price">$${formatPrice(t.lastPrice)}</td>
             <td>${formatChange(t.change1h)}</td>
             <td>${formatChange(t.change4h)}</td>
             <td>${formatChange(t.change24h)}</td>
-            <td class="volume hide-mobile">$${formatVolume(t.quoteVolume)}</td>
+            <td class="hide-mobile">${formatSpread(t.spreadPct)}</td>
+            <td class="hide-mobile">${formatDepth(t.depth2pct)}</td>
+            <td class="muted hide-mobile">$${formatVolume(t.quoteVolume)}</td>
           </tr>
         `;
       });
@@ -274,7 +321,7 @@
         sortDir = sortDir === 'desc' ? 'asc' : 'desc';
       } else {
         sortKey = key;
-        sortDir = (key === 'symbol') ? 'asc' : 'desc';
+        sortDir = (key === 'symbol' || key === 'spread') ? 'asc' : 'desc';
       }
       document.getElementById('sortBy').value = sortKey;
       document.getElementById('sortDir').value = sortDir;
@@ -283,18 +330,20 @@
 
     async function enrichInBackground(market) {
       const status = document.getElementById('status');
-      status.textContent = 'Calculando variaciones 1h y 4h...';
+      status.textContent = 'Calculando 1h, 4h y liquidez (top 25)...';
       try {
         const res = await fetch(`/api/enrich?market=${market}`);
         const json = await res.json();
         if (!json.ok) throw new Error(json.error || 'Error al enriquecer');
-        if (market !== currentMarket) return; // cambió de mercado mientras cargaba
+        if (market !== currentMarket) return;
         rawData = json.data;
         render();
-        status.textContent = 'Variaciones 1h / 4h listas';
-        setTimeout(() => { if (status.textContent.includes('listas')) status.textContent = ''; }, 2500);
+        status.textContent = '1h / 4h / liquidez listos';
+        setTimeout(() => {
+          if (status.textContent.includes('listos')) status.textContent = '';
+        }, 2500);
       } catch (err) {
-        status.textContent = 'No se pudieron cargar 1h/4h (se muestran 24h)';
+        status.textContent = 'No se pudieron cargar 1h/4h/liquidez (se muestran 24h)';
         console.error(err);
       }
     }
@@ -326,17 +375,17 @@
         render();
         btn.disabled = false;
 
-        // Si aún no tiene 1h/4h, completar en background
         if (!json.enriched) {
           enrichInBackground(market);
         }
       } catch (err) {
-        content.innerHTML = `<div class="error">Error: ${err.message}<br><br>Reintentá en unos segundos.</div>`;
+        content.innerHTML = `<div class="error">Error: ${err.message}<br><br>Reintentá con Actualizar.</div>`;
         btn.disabled = false;
       }
     }
 
-    document.getElementById('minVolume').addEventListener('input', render);
+    document.getElementById('minVolume').addEventListener('change', render);
+    document.getElementById('assetType').addEventListener('change', render);
     document.getElementById('sortBy').addEventListener('change', (e) => {
       sortKey = e.target.value;
       render();
@@ -347,8 +396,8 @@
     });
     document.getElementById('market').addEventListener('change', fetchData);
 
+    // Solo carga inicial — sin auto-refresh
     fetchData();
-    setInterval(fetchData, 120000);
   </script>
 </body>
 </html>
